@@ -107,6 +107,15 @@ memory_size = cfg.TMRL_CONFIG["MEMORY_SIZE"]
 # Batch size for training:
 batch_size = cfg.TMRL_CONFIG["BATCH_SIZE"]
 
+# set epsilon for PPO
+epsilon = cfg.TMRL_CONFIG["PPO_EPSILON"]  #TODO: make epsilon a config constant
+
+# get type of distribution for Policy Module
+distribution = cfg.TMRL_CONFIG["DISTRIBUTION"]
+
+# get architecture of Policy Module
+policy_architecture = cfg.TMRL_CONFIG["POLICY_ARCHITECTURE"]
+
 # Wandb credentials:
 # (Change this with your own if you want to keep your training curves private)
 # (Also, please use your own wandb account if you are going to log huge stuff :) )
@@ -243,6 +252,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
+from torch.distributions.kumaraswamy import Kumaraswamy
 from math import floor
 
 
@@ -335,15 +345,10 @@ class VanillaCNN(nn.Module):
         self.mlp = mlp([self.mlp_input_features] + self.mlp_layers, nn.ReLU)
 
     def forward(self, x):
-        """
-        In Pytorch, the forward function is where our neural network computes its output from its input.
 
-        Args:
-            x (torch.Tensor): input tensor (i.e., the observation fed to our deep neural network)
+        # for element in x:
+        #     print(element.shape)
 
-        Returns:
-            the output of our neural network in the form of a torch.Tensor
-        """
         if self.q_net:
             # The critic takes the next action (act) as additional input
             # act1 and act2 are the actions in the action buffer (real-time RL):
@@ -356,6 +361,7 @@ class VanillaCNN(nn.Module):
         # (note that the competition environment outputs histories of 4 images
         # and the default config outputs these as 64 x 64 greyscale,
         # we will stack these greyscale images along the channel dimension of our input tensor)
+
         x = F.relu(self.conv1(images))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
@@ -381,6 +387,201 @@ class VanillaCNN(nn.Module):
 
         # And this gives us the output of our deep neural network :)
         return x
+
+"""
+Custom policy module
+"""
+import torchvision.models as models
+
+# ResNet
+class PolicyResNet(nn.Module):
+    def __init__(self, q_net, num_classes, start_frozen=False):
+        super(PolicyResNet, self).__init__()
+        self.q_net = q_net
+        # Load the model - make sure it is pre-trained
+        self.model = models.resnet152(pretrained=True)
+
+        # Turn off all gradients of the resnet
+        if start_frozen:
+            self.freeze()
+
+        # Override the last layer of the neural network, fc (fully connected), to map to the correct number of classes. Note that this new layer has requires_grad = True
+        self.model.fc = nn.Linear(2048, num_classes)
+
+        # The default config.json gives 4 grayscale images of 64 x 64 pixels
+        self.h_out, self.w_out = img_height, img_width
+
+        # Dimensionality of the CNN output:
+        self.flat_features = num_classes
+
+        # Dimensionality of the MLP input:
+        # The MLP input will be formed of:
+        # - the flattened CNN output
+        # - the current speed, gear and RPM measurements (3 floats)
+        # - the 2 previous actions (2 x 3 floats), important because of the real-time nature of our controller
+        # - when the module is the critic, the selected action (3 floats)
+        float_features = 12 if self.q_net else 9
+        self.mlp_input_features = self.flat_features + float_features
+
+        # MLP layers:
+        # (when using the model as a policy, we will sample from a multivariate gaussian defined later in the tutorial;
+        # thus, the output dimensionality is  1 for the critic, and we will define the output layer of policies later)
+        self.mlp_layers = [256, 256, 1] if self.q_net else [256, 256]
+        self.mlp = mlp([self.mlp_input_features] + self.mlp_layers, nn.ReLU)
+
+    def freeze(self):
+        """
+        freeze all the layers except the last one
+        """
+        for param in self.model.parameters():
+            if param is not self.model.fc.weight and param is not self.model.fc.bias:
+                param.requires_grad = False
+
+    def unfreeze(self, n_layers):
+        """
+        Unfreeze the last n_layers
+        """
+        for param in list(self.model.parameters())[-n_layers:]: # equivalent to a double nested for loop with over layers in modules then parameters in layers
+            param.requires_grad = True
+
+    def forward(self, x):
+        if self.q_net:
+            # The critic takes the next action (act) as additional input
+            # act1 and act2 are the actions in the action buffer (real-time RL):
+            speed, gear, rpm, images, act1, act2, act = x
+        else:
+            # For the policy, the next action (act) is what we are computing, so we don't have it:
+            speed, gear, rpm, images, act1, act2 = x
+
+        # # Forward pass of our images in the CNN:
+        # # (note that the competition environment outputs histories of 4 images
+        # # and the default config outputs these as 64 x 64 greyscale,
+        # # we will stack these greyscale images along the channel dimension of our input tensor)
+            
+        x = self.model(x)
+
+        # Now we will flatten our output feature map.
+        # Let us double-check that our dimensions are what we expect them to be:
+        flat_features = num_flat_features(x)
+        assert flat_features == self.flat_features, f"x.shape:{x.shape},\
+                                                    flat_features:{flat_features},\
+                                                    self.out_channels:{self.out_channels},\
+                                                    self.h_out:{self.h_out},\
+                                                    self.w_out:{self.w_out}"
+        # All good, let us flatten our output feature map:
+        x = x.view(-1, flat_features)
+
+        # Finally, we can feed the result along our float values to the MLP:
+        if self.q_net:
+            x = torch.cat((speed, gear, rpm, x, act1, act2, act), -1)
+        else:
+            x = torch.cat((speed, gear, rpm, x, act1, act2), -1)
+        x = self.mlp(x)
+
+        # And this gives us the output of our deep neural network :)
+        return x
+
+# VGG
+class PolicyVGG(nn.Module):
+    def __init__(self, q_net, num_classes, start_frozen=False):
+        super(PolicyResNet, self).__init__()
+        self.q_net = q_net
+
+        # The default config.json gives 4 grayscale images of 64 x 64 pixels
+        self.h_out, self.w_out = img_height, img_width
+
+        # Load the model - make sure it is pre-trained
+        self.model = models.vgg16(pretrained=True)
+        # for i, m in enumerate(self.model.children()):
+        #     if isinstance(m, nn.ReLU):   # we want to set the relu layers to NOT do the relu in place.
+        #     m.inplace = False          # the model has a hard time going backwards on the in place functions.
+        
+        # modify the last layer to output the correct number of classes
+        self.model.classifier = nn.Sequential(nn.Linear(512 * 7 * 7, 4096),
+                                            nn.ReLU(True),
+                                            nn.Dropout(p=dropout),
+                                            nn.Linear(4096, 4096),
+                                            nn.ReLU(True),
+                                            nn.Dropout(p=dropout),
+                                            nn.Linear(4096, num_classes),
+                                            )
+        # Turn off all gradients of the resnet
+        if start_frozen:
+            self.freeze()
+
+
+        # Dimensionality of the CNN output:
+        self.flat_features = self.out_channels * self.h_out * self.w_out
+
+        # Dimensionality of the MLP input:
+        # The MLP input will be formed of:
+        # - the flattened CNN output
+        # - the current speed, gear and RPM measurements (3 floats)
+        # - the 2 previous actions (2 x 3 floats), important because of the real-time nature of our controller
+        # - when the module is the critic, the selected action (3 floats)
+        float_features = 12 if self.q_net else 9
+        self.mlp_input_features = self.flat_features + float_features
+
+        # MLP layers:
+        # (when using the model as a policy, we will sample from a multivariate gaussian defined later in the tutorial;
+        # thus, the output dimensionality is  1 for the critic, and we will define the output layer of policies later)
+        self.mlp_layers = [256, 256, 1] if self.q_net else [256, 256]
+        self.mlp = mlp([self.mlp_input_features] + self.mlp_layers, nn.ReLU)
+
+    def freeze(self):
+        """
+        freeze all the layers except the last one
+        """
+        #TODO: Not sure if this is the way to do it for VGG
+        for param in self.model.parameters():
+            if param is not self.model.fc.weight and param is not self.model.fc.bias:
+                param.requires_grad = False
+
+    def unfreeze(self, n_layers):
+        """
+        Unfreeze the last n_layers
+        """
+        for param in list(self.model.parameters())[-n_layers:]: # equivalent to a double nested for loop with over layers in modules then parameters in layers
+            param.requires_grad = True
+
+    def forward(self, x):
+        if self.q_net:
+            # The critic takes the next action (act) as additional input
+            # act1 and act2 are the actions in the action buffer (real-time RL):
+            speed, gear, rpm, images, act1, act2, act = x
+        else:
+            # For the policy, the next action (act) is what we are computing, so we don't have it:
+            speed, gear, rpm, images, act1, act2 = x
+
+        # # Forward pass of our images in the CNN:
+        # # (note that the competition environment outputs histories of 4 images
+        # # and the default config outputs these as 64 x 64 greyscale,
+        # # we will stack these greyscale images along the channel dimension of our input tensor)
+            
+        x = self.model(x)
+
+        # Now we will flatten our output feature map.
+        # Let us double-check that our dimensions are what we expect them to be:
+        flat_features = num_flat_features(x)
+        assert flat_features == self.flat_features, f"x.shape:{x.shape},\
+                                                    flat_features:{flat_features},\
+                                                    self.out_channels:{self.out_channels},\
+                                                    self.h_out:{self.h_out},\
+                                                    self.w_out:{self.w_out}"
+        # All good, let us flatten our output feature map:
+        x = x.view(-1, flat_features)
+
+        # Finally, we can feed the result along our float values to the MLP:
+        if self.q_net:
+            x = torch.cat((speed, gear, rpm, x, act1, act2, act), -1)
+        else:
+            x = torch.cat((speed, gear, rpm, x, act1, act2), -1)
+        x = self.mlp(x)
+
+        # And this gives us the output of our deep neural network :)
+        return x
+
+        
 
 
 # We can now implement the TMRL ActorModule interface that we are supposed to submit for this competition.
@@ -420,7 +621,7 @@ class TorchJSONDecoder(json.JSONDecoder):
         return dct
 
 
-class MyActorModule(TorchActorModule):
+class PolicyModule(TorchActorModule):
     """
     Our policy wrapped in the TMRL ActorModule class.
 
@@ -447,6 +648,8 @@ class MyActorModule(TorchActorModule):
         self.net = VanillaCNN(q_net=False)
         # The policy output layer, which samples actions stochastically in a gaussian, with means...:
         self.mu_layer = nn.Linear(256, dim_act)
+        if distribution == "Kumaraswamy":
+            self.concen_2 = nn.Linear(256, dim_act)
         # ... and log standard deviations:
         self.log_std_layer = nn.Linear(256, dim_act)
         # We will squash this within the action space thanks to a tanh final activation:
@@ -494,10 +697,6 @@ class MyActorModule(TorchActorModule):
         """
         Computes the output action of our policy from the input observation.
 
-        The whole point of deep RL is to train our policy network (actor) such that it outputs relevant actions.
-        Training per-se will also rely on a critic network, but this is not part of the trained policy.
-        Thus, our ActorModule will only implement the actor.
-
         Args:
             obs: the observation from the Gymnasium environment (when using TorchActorModule this is a torch.Tensor)
             test (bool): this is True for test episodes (deployment) and False for training episodes;
@@ -515,29 +714,35 @@ class MyActorModule(TorchActorModule):
         net_out = self.net(obs)
         # Now, the means of our multivariate gaussian (i.e., Normal law) are:
         mu = self.mu_layer(net_out)
+        if distribution == "Kumaraswamy":
+            concen_2 = self.concen_2(net_out)
+            pi_distribution = Kumaraswamy(mu, concen_2)
+        else:
+            pi_distribution = Normal(mu, std)
         # And the corresponding standard deviations are:
         log_std = self.log_std_layer(net_out)
         log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
         std = torch.exp(log_std)
+
         # We can now sample our action in the resulting multivariate gaussian (Normal) distribution:
-        pi_distribution = Normal(mu, std)
+        pi_action = pi_distribution.rsample()  # during training, it is sampled in the multivariate gaussian
         if test:
-            pi_action = mu  # at test time, our action is deterministic (it is just the means)
-        else:
-            pi_action = pi_distribution.rsample()  # during training, it is sampled in the multivariate gaussian
+            if distribution == "Normal":
+                pi_action = mu  # at test time, our action is deterministic (it is just the means)
+        
         # We retrieve the log probabilities of our multivariate gaussian as they will be useful for SAC:
-        if compute_logprob:
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            # (the next line is a correction formula for TanH squashing, present in the Spinup implementation of SAC)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
-        else:
-            logp_pi = None
+        # if compute_logprob:
+        #     logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
+        #     # (the next line is a correction formula for TanH squashing, present in the Spinup implementation of SAC)
+        #     logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
+        # else:
+        #     logp_pi = None
         # And we squash our action within the action space:
         pi_action = torch.tanh(pi_action)
         pi_action = self.act_limit * pi_action
         # Finally, we remove the batch dimension:
         pi_action = pi_action.squeeze()
-        return pi_action, logp_pi
+        return pi_action, pi_distribution
 
     # Now, the only method that all participants are required to implement is act()
     # act() is the interface for TMRL to use your ActorModule as the policy it tests in TrackMania.
@@ -567,14 +772,19 @@ class MyActorModule(TorchActorModule):
             return a.cpu().numpy()
 
 
-# The critic module for SAC is now super straightforward:
-class VanillaCNNQFunction(nn.Module):
+# Value network
+class ValueNetwork(nn.Module):
     """
-    Critic module for SAC.
+    Value network module for PPO.
     """
     def __init__(self, observation_space, action_space):
         super().__init__()
-        self.net = VanillaCNN(q_net=True)  # q_net is True for a critic module
+        if policy_architecture == "CNN":
+            self.net = VanillaCNN(q_net=True)  # q_net is True for a critic module
+        elif policy_architecture == "ResNet":
+            self.net = PolicyResNet(q_net=True, num_classes=1, start_frozen=True)
+        elif policy_architecture == "VGG":
+            self.net = PolicyVGG(q_net=True, num_classes=1, start_frozen=True)
 
     def forward(self, obs, act):
         """
@@ -599,19 +809,17 @@ class VanillaCNNQFunction(nn.Module):
 
 # Finally, let us merge this together into an actor-critic torch.nn.module for training.
 # Classically, we use one actor and two parallel critics to alleviate the overestimation bias.
-class VanillaCNNActorCritic(nn.Module):
+class PolicyValue(nn.Module):
     """
-    Actor-critic module for the SAC algorithm.
+    policy-value module for the PPO algorithm.
     """
     def __init__(self, observation_space, action_space):
         super().__init__()
 
-        # Policy network (actor):
-        self.actor = MyActorModule(observation_space, action_space)
-        # Value networks (critics):
-        self.q1 = VanillaCNNQFunction(observation_space, action_space)
-        self.q2 = VanillaCNNQFunction(observation_space, action_space)
-
+        # Policy network:
+        self.policy = PolicyModule(observation_space, action_space)
+        # Value networks:
+        self.value = ValueNetwork(observation_space, action_space)
 
 # =====================================================================
 # CUSTOM TRAINING ALGORITHM
@@ -620,7 +828,7 @@ class VanillaCNNActorCritic(nn.Module):
 # We have also wrapped it in an ActorModule, which we will train and
 # submit as an entry to the TMRL competition.
 # Our ActorModule will be used in Workers to collect training data.
-# Our VanillaCNNActorCritic will be used in the Trainer for training
+# Our PolicyValue will be used in the Trainer for training
 # this ActorModule. Let us now tackle the training algorithm per-se.
 # In TMRL, this is done by implementing a custom TrainingAgent.
 
@@ -641,7 +849,7 @@ from torch.optim import Adam
 # In this tutorial, we implement the Soft Actor-Critic algorithm
 # by adapting the OpenAI Spinup implementation.
 
-class SACTrainingAgent(TrainingAgent):
+class PPOTrainingAgent(TrainingAgent):
     """
     Our custom training algorithm (SAC in this tutorial).
 
@@ -663,12 +871,13 @@ class SACTrainingAgent(TrainingAgent):
                  observation_space=None,  # Gymnasium observation space (required argument here for your convenience)
                  action_space=None,  # Gymnasium action space (required argument here for your convenience)
                  device=None,  # Device our TrainingAgent should use for training (required argument)
-                 model_cls=VanillaCNNActorCritic,  # An actor-critic module, encapsulating our ActorModule
+                 model_cls=PolicyValue,  # An actor-critic module, encapsulating our ActorModule
                  gamma=0.99,  # Discount factor
                  polyak=0.995,  # Exponential averaging factor for the target critic
                  alpha=0.2,  # Value of the entropy coefficient
                  lr_actor=1e-3,  # Learning rate for the actor
-                 lr_critic=1e-3):  # Learning rate for the critic
+                 lr_critic=1e-3,
+                 max_unfreeze=0):  # Learning rate for the critic
 
         # required arguments passed to the superclass:
         super().__init__(observation_space=observation_space,
@@ -678,16 +887,20 @@ class SACTrainingAgent(TrainingAgent):
         # custom stuff:
         model = model_cls(observation_space, action_space)
         self.model = model.to(self.device)
-        self.model_target = no_grad(deepcopy(self.model))
+        # self.model_target = no_grad(deepcopy(self.model))
+        # TODO: Remove uneccessary parameters
         self.gamma = gamma
         self.polyak = polyak
         self.alpha = alpha
         self.lr_actor = lr_actor
         self.lr_critic = lr_critic
         self.q_params = itertools.chain(self.model.q1.parameters(), self.model.q2.parameters())
-        self.pi_optimizer = Adam(self.model.actor.parameters(), lr=self.lr_actor)
+        self.pi_optimizer = Adam(self.model.actor.parameters(), lr=self.lr_actor)  #TODO: endure that the optimizer is set up correctly
         self.q_optimizer = Adam(self.q_params, lr=self.lr_critic)
         self.alpha_t = torch.tensor(float(self.alpha)).to(self.device)
+
+        self.max_unfreeze = max_unfreeze
+        self.cur_freeze = 1  # for transfer learning
 
     def get_actor(self):
         """
@@ -700,7 +913,7 @@ class SACTrainingAgent(TrainingAgent):
         """
         return self.model_nograd.actor
 
-    def train(self, batch):
+    def train(self, batch, epoch): #TODO: change TrainingOffline to pass the epoch to the train method
         """
         Executes a training iteration from batched training samples (batches of RL transitions).
 
@@ -724,66 +937,62 @@ class SACTrainingAgent(TrainingAgent):
         Returns:
             logs: Dictionary: a python dictionary of training metrics you wish to log on wandb
         """
+        
+        # TODO: incorporate the value/return into the batch. I think this has to be done between getting it from the worker and passing it in here, also before the creating any dataloader
         # First, we decompose our batch into its relevant components, ignoring the "truncated" signal:
-        o, a, r, o2, d, _ = batch
+        o, a, r, o2, d, _, v, a_dist = batch  
+        # we get the value of the state from our value network
+        state_val = self.model.value(o, a)
+
+        v = v.unsqueeze(1)  # TODO: check the resizing
+        value_loss = torch.pow(v - state_val, 2).mean()
 
         # We sample an action in the current policy and retrieve its corresponding log probability:
-        pi, logp_pi = self.model.actor(obs=o, test=False, compute_logprob=True)
+        action, pi_dist = self.model.policy(obs=o, test=False, compute_logprob=True)
 
-        # We also compute our action-value estimates for the current transition:
-        q1 = self.model.q1(o, a)
-        q2 = self.model.q2(o, a)
+        logp_pi = pi_dist.log_prob(action).sum(axis=-1)
+        # (the next line is a correction formula for TanH squashing, present in the Spinup implementation of SAC)
+        logp_pi -= (2 * (np.log(2) - action - F.softplus(-2 * action))).sum(axis=1)
+        
+        # sample log probability of action from 
+        old_logprob_pi = a_dist.log_prob(a).sum(axis=-1)
+        old_logprob_pi -= (2 * (np.log(2) - a - F.softplus(-2 * a))).sum(axis=1)
 
-        # Now we compute our value target, for which we need to detach from gradients computation:
-        with torch.no_grad():
-            a2, logp_a2 = self.model.actor(o2)
-            q1_pi_targ = self.model_target.q1(o2, a2)
-            q2_pi_targ = self.model_target.q2(o2, a2)
-            q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
-            backup = r + self.gamma * (1 - d) * (q_pi_targ - self.alpha_t * logp_a2)
+        ratio = logp_pi - old_logprob_pi  # log(A/B) = log(A) - log(B)
 
-        # This gives us our critic loss, as the difference between the target and the estimate:
-        loss_q1 = ((q1 - backup)**2).mean()
-        loss_q2 = ((q2 - backup)**2).mean()
-        loss_q = loss_q1 + loss_q2
+        advantage = (v - state_val).detach()  # don't permit gradient flow as part of policy loss
 
-        # We can now take an optimization step to train our critics in the opposite direction of this loss' gradient:
-        self.q_optimizer.zero_grad()
-        loss_q.backward()
-        self.q_optimizer.step()
+        # get surrogate
+        surr1 = torch.mul(ratio, advantage)
+        surr2 = torch.mul(torch.clamp(ratio, 1-epsilon, 1+epsilon), advantage)
 
-        # For the policy optimization step, we detach our critics from the gradient computation graph:
-        for p in self.q_params:
-            p.requires_grad = False
+        policy_loss = -torch.mean(torch.min(surr1, surr2))
 
-        # We use the critics to estimate the value of the action we have sampled in the current policy:
-        q1_pi = self.model.q1(o, pi)
-        q2_pi = self.model.q2(o, pi)
-        q_pi = torch.min(q1_pi, q2_pi)
+        loss = policy_loss + value_loss
 
-        # Our policy loss is now the opposite of this value estimate, augmented with the entropy of the current policy:
-        loss_pi = (self.alpha_t * logp_pi - q_pi).mean()
-
-        # Now we can train our policy in the opposite direction of this loss' gradient:
         self.pi_optimizer.zero_grad()
-        loss_pi.backward()
+        loss.backward()
         self.pi_optimizer.step()
 
-        # We attach the critics back into the gradient computation graph:
-        for p in self.q_params:
-            p.requires_grad = True
+        # unfreeze a layer of the policy model
+        # TODO: the effectiveness of this is dependent on the total number of epochs. If there aren't many epoch, probably less than 100, then there won't be enough time to unfreeze all the layers
+        # TODO: instead of epochs, this could be based on the number of iterations through the training loop
+        if epoch < self.max_unfreeze:
+            self.model.policy.unfreeze(self.cur_freeze)
+            self.cur_freeze += 1
 
-        # Finally, we update our target model with a slowly moving exponential average:
-        with torch.no_grad():
-            for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
-                p_targ.data.mul_(self.polyak)
-                p_targ.data.add_((1 - self.polyak) * p.data)
+        # # Finally, we update our target model with a slowly moving exponential average:
+        # with torch.no_grad():
+        #     for p, p_targ in zip(self.model.parameters(), self.model_target.parameters()):
+        #         p_targ.data.mul_(self.polyak)
+        #         p_targ.data.add_((1 - self.polyak) * p.data)
 
         # TMRL enables us to log training metrics to wandb:
         ret_dict = dict(
-            loss_actor=loss_pi.detach().item(),
-            loss_critic=loss_q.detach().item(),
+            loss_policy=policy_loss.detach().item(),
+            loss_value=value_loss.detach().item(),
         )
+
         return ret_dict
 
 
@@ -793,13 +1002,14 @@ class SACTrainingAgent(TrainingAgent):
 # The following have shown reasonable results in the past, using the full TrackMania environment.
 # Note however that training a policy with SAC in this environment is a matter of several days!
 
-training_agent_cls = partial(SACTrainingAgent,
-                             model_cls=VanillaCNNActorCritic,
+training_agent_cls = partial(PPOTrainingAgent,
+                             model_cls=PolicyValue,
                              gamma=0.99,
                              polyak=0.995,
                              alpha=0.02,
                              lr_actor=0.000005,
-                             lr_critic=0.00003)
+                             lr_critic=0.00003,
+                             max_unfreeze=20)
 
 
 # =====================================================================
@@ -856,7 +1066,7 @@ if __name__ == "__main__":
                                   run_id=wandb_run_id)
     elif args.worker or args.test:
         rw = RolloutWorker(env_cls=env_cls,
-                           actor_module_cls=MyActorModule,
+                           actor_module_cls=PolicyModule,
                            sample_compressor=sample_compressor,
                            device=device_worker,
                            server_ip=server_ip_for_worker,
@@ -874,3 +1084,15 @@ if __name__ == "__main__":
                       security=security)
         while True:
             time.sleep(1.0)
+
+
+"""
+To Do:
+- ensure resizing of last layer is correct for VGG and ResNet
+- get the value/return into the batch
+- make the epoch a parameter of the train method
+- unfreeze a layer of the policy and value models at each epoch
+    - this will may depend on the type of model (CNN, ResNet, VGG)
+- understand unfreezing for VGG
+
+"""
